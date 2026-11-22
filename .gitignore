@@ -1,0 +1,14 @@
+# data is downloaded by scripts/get_data.R
+data/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+renv/library/
+renv/staging/
+
+# rendered output that is not kept
+analysis/*.html
+analysis/*_cache/
