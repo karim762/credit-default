@@ -1,0 +1,202 @@
+---
+title: "1. Data and features"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3.6, dpi = 150)
+```
+
+```{r load}
+source("R/features.R")
+source("R/plotting.R")
+x <- readRDS("data/credit.rds")
+y <- x$default
+f <- build_features(x)
+pct <- function(v, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * v)
+```
+
+The data are the `r format(nrow(x), big.mark = ",")` credit card holders of a
+Taiwanese bank studied by Yeh and Lien (2009). For each client we observe the
+credit limit, a few demographic variables and six months of history, April to
+September 2005: the repayment status `PAY_t`, the statement balance `BILL_AMT_t`
+and the amount paid `PAY_AMT_t`. The target is whether the client defaults in
+October 2005; `r pct(mean(y))` do.
+
+Month `t = 1` is September and `t = 6` is April. The source file calls the
+September status `PAY_0` and has no `PAY_1`; it is renamed `PAY_1` here so that
+the three monthly series share the same index.
+
+`SEX` is dropped from every model. A credit decision may not depend on it, and
+leaving it out of the inputs is the minimum; the decision rule is checked for
+differences between groups at the end of the project.
+
+## Repayment status codes
+
+The documentation describes `PAY_t = -1` as "paid duly" and `PAY_t = k` for
+`k = 1, ..., 9` as a payment delay of `k` months. The values `-2` and `0`, which
+make up most of the data, are not documented. The amounts tell what they mean.
+For every status, the table gives the share of client-months in which the
+previous statement was paid in full and the share in which the current balance
+is zero or negative.
+
+```{r codes}
+codes <- do.call(rbind, lapply(2:5, function(t) data.frame(
+  code = x[[paste0("PAY_", t)]],
+  owed = x[[paste0("BILL_AMT", t + 1)]],
+  paid = x[[paste0("PAY_AMT", t)]],
+  bill = x[[paste0("BILL_AMT", t)]]
+)))
+codes$group <- ifelse(codes$code >= 1, "1 to 8", as.character(codes$code))
+tab <- do.call(rbind, lapply(split(codes, codes$group), function(d) data.frame(
+  status = d$group[1],
+  `client-months` = format(nrow(d), big.mark = ","),
+  `previous statement paid in full` = pct(sum(d$paid >= d$owed & d$owed > 0) / sum(d$owed > 0)),
+  `balance zero or negative` = pct(mean(d$bill <= 0)),
+  check.names = FALSE
+)))
+tab <- tab[c("-2", "-1", "0", "1 to 8"), ]
+knitr::kable(tab, row.names = FALSE, align = "lrrr")
+```
+
+`-1` is a client who clears the statement, as documented. `-2` is a client with
+nothing to pay, either no balance or a balance already settled. `0` is a client
+who uses the revolving credit: the statement is not cleared, but the client is
+not reported late. The codes are therefore not an ordered scale, and the default rate confirms
+it: revolving clients (`0`) default less often than clients who pay in full
+(`-1`).
+
+```{r status-plot}
+d <- data.frame(code = factor(x$PAY_1), y = y)
+d <- aggregate(y ~ code, d, function(v) c(rate = mean(v), n = length(v)))
+d <- data.frame(code = d$code, rate = d$y[, "rate"], n = d$y[, "n"])
+d <- d[d$n >= 100, ]
+ggplot(d, aes(code, rate)) +
+  geom_col(fill = ifelse(as.integer(as.character(d$code)) <= 0, palette_main["mid"], palette_main["accent"]),
+           width = 0.7) +
+  geom_text(aes(label = format(n, big.mark = ",")), vjust = -0.4, size = 3, colour = "grey30") +
+  scale_y_continuous(labels = percent_axis, expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Default rate by September repayment status",
+       subtitle = "Codes with at least 100 clients; labels give the number of clients",
+       x = "PAY_1", y = "Default rate in October") +
+  theme_report()
+```
+
+The code `1` also behaves differently from one month to the next. It is
+frequent in September and almost absent before:
+
+```{r code-one}
+ones <- sapply(1:6, function(t) sum(x[[paste0("PAY_", t)]] == 1))
+knitr::kable(data.frame(t(setNames(format(ones, big.mark = ","), c("Sep", "Aug", "Jul", "Jun", "May", "Apr")))),
+             align = "r", row.names = FALSE)
+```
+
+In the earlier months a client one month late seems to be recorded as `2` or
+not at all. The features below therefore use the number of months late and
+whether a client is late at all, rather than the exact code.
+
+## Which statement does a payment settle?
+
+Since `t` counts backwards, the statement of the previous month is
+`BILL_AMT_{t+1}`. A payment made in month `t` should settle that statement, not
+the one issued at the end of month `t`. The data agree: the
+amount paid matches the previous statement exactly far more often than it
+matches the current one.
+
+```{r timing}
+timing <- data.frame(
+  month = c("Sep", "Aug", "Jul", "Jun", "May"),
+  `equals previous statement` = sapply(1:5, function(t)
+    pct(mean(x[[paste0("PAY_AMT", t)]] == x[[paste0("BILL_AMT", t + 1)]] & x[[paste0("BILL_AMT", t + 1)]] > 0))),
+  `equals same-month statement` = sapply(1:5, function(t)
+    pct(mean(x[[paste0("PAY_AMT", t)]] == x[[paste0("BILL_AMT", t)]] & x[[paste0("BILL_AMT", t)]] > 0))),
+  check.names = FALSE
+)
+knitr::kable(timing, align = "lrr")
+```
+
+Ratios of payment to balance taken within the same month mix two different
+statements. All ratios below are aligned.
+
+## Features
+
+Writing $B_t$ for the statement balance, $P_t$ for the amount paid and $L$ for
+the credit limit:
+
+| Feature | Definition |
+|---|---|
+| `status_1`, `delay_1` | September status (no balance, paid in full, revolving, late) and months late |
+| `max_delay`, `months_late` | worst delay and number of months late over the six months |
+| `months_full`, `months_revolv` | number of months with status `-1` and `0` |
+| `worsening` | September delay larger than August delay |
+| `util_1`, `util_mean`, `util_slope` | utilisation $u_t = B_t / L$: last value, mean and least-squares trend |
+| `repay_1`, `repay_mean` | repayment ratio $r_t = \min(P_t / B_{t+1}, 1)$, set to 1 when $B_{t+1} \le 0$ |
+| `months_no_pay` | months with $B_{t+1} > 0$ and $P_t = 0$ |
+| `spend_1`, `spend_mean` | implied new spending $(B_t - B_{t+1} + P_t) / L$ |
+| `log_limit`, `age`, `education`, `marriage` | as given; undocumented education and marriage codes grouped as `other` |
+
+The spending feature comes from the balance identity
+$B_t = B_{t+1} - P_t + \text{purchases}_t + \text{interest and fees}_t$.
+It is the only feature that separates a balance that grows because the client
+keeps buying from one that grows because nothing is paid.
+
+How well does each feature rank clients on its own? The table gives the AUC of
+each numeric feature used as a score, oriented so that it is above one half.
+
+```{r univariate}
+auc <- function(s) {
+  r <- rank(s); n1 <- sum(y); n0 <- length(y) - n1
+  a <- (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+  max(a, 1 - a)
+}
+num <- names(f)[sapply(f, is.numeric)]
+same_month <- pmin(ifelse(x$BILL_AMT1 > 0, x$PAY_AMT1 / x$BILL_AMT1, 1), 1)
+a <- c(sapply(f[num], auc), `repay_1, same-month statement` = auc(same_month), `PAY_1 as a number` = auc(x$PAY_1))
+a <- sort(a, decreasing = TRUE)
+knitr::kable(data.frame(feature = names(a), AUC = sprintf("%.3f", a)), row.names = FALSE, align = "lr")
+```
+
+The delinquency history dominates, as expected. Counting the months late
+(`r sprintf("%.3f", a["months_late"])`) ranks clients better than the raw
+September code (`r sprintf("%.3f", a["PAY_1 as a number"])`). Aligning the
+repayment ratio with the right statement raises its AUC from
+`r sprintf("%.3f", a["repay_1, same-month statement"])` to
+`r sprintf("%.3f", a["repay_1"])`.
+
+## Spending while not repaying
+
+The expectation was that clients who stop repaying but keep spending, living on
+the card, would be the riskiest. The data say otherwise.
+
+```{r spending}
+low_repay <- f$repay_mean < 0.1
+spending <- f$spend_mean > 0.02
+grp <- data.frame(
+  ` ` = c("repays less than 10% on average", "repays more"),
+  `no new spending` = c(pct(mean(y[low_repay & !spending])), pct(mean(y[!low_repay & !spending]))),
+  `keeps spending` = c(pct(mean(y[low_repay & spending])), pct(mean(y[!low_repay & spending]))),
+  check.names = FALSE
+)
+knitr::kable(grp, align = "lrr")
+late <- tapply(f$months_late, interaction(low_repay, spending), mean)
+```
+
+The riskiest group repays little and does not spend. These clients were late in
+`r sprintf("%.1f", late["TRUE.FALSE"])` of the six months on average, against
+`r sprintf("%.1f", late["TRUE.TRUE"])` for those who still spend: their balance
+grows through interest and fees, and the card may well be restricted. Low
+spending is then a consequence of delinquency as much as a cause of default.
+The feature is kept, since it carries information the other features do not,
+but it is not read causally.
+
+## Inputs to the models
+
+Two input sets are compared in the next part.
+
+- **Raw**: the 22 original columns except `SEX`, with the `PAY_t` codes as
+  numbers. This is what most analyses of this data set use.
+- **Engineered**: the features above.
+
+If the engineered set does not improve out-of-sample log loss, it is not used.
