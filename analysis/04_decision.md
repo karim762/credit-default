@@ -137,14 +137,16 @@ a decision.
 
 The two regions were drawn after looking at this curve on the test set,
 so the intervals above are not those of a test fixed in advance. Part 5
-checks whether the same pattern appears on other splits of the data.
+checks the pattern on ten other splits: the advantage of XGBoost at low
+cost ratios holds, the lead of the logistic regression in the middle
+range does not: no statistically detectable difference remains there.
 
 **The choice between the two models is a business decision.** For a bank
-whose cost ratio lies in the middle range, the logistic regression does
-at least as well as XGBoost on this test set, and it is additive,
-readable and cheaper to validate and monitor. For a bank that acts at
-low thresholds, XGBoost is the better candidate. Part 6 looks at what
-each model has learned.
+whose cost ratio lies in the middle range, no difference in simulated
+value between the two models could be detected across the splits of part
+5, and the logistic regression is additive, readable and cheaper to
+validate and monitor. For a bank that acts at low thresholds, XGBoost is
+the better candidate. Part 6 looks at what each model has learned.
 
 ## Limits
 

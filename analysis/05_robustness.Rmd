@@ -1,0 +1,160 @@
+---
+title: "5. Robustness over splits"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7.5, fig.height = 3.8, dpi = 150)
+```
+
+```{r load}
+source("R/plotting.R")
+sp <- readRDS("results/splits.rds")
+J <- length(sp)
+f4 <- function(v) sprintf("%.4f", v)
+f3 <- function(v) sprintf("%.3f", v)
+```
+
+The results of parts 2 to 4 come from one split of the clients into training
+and test sets. Here the whole procedure is repeated on `r J` new splits: a new
+stratified test set of 25%, new folds, the features, the tuning of both models
+by cross-validation on the training part (20 boosting configurations instead
+of 30, to keep the run time reasonable), the final fit and the evaluation on the
+test part. The numbers come from `scripts/run_splits.R`.
+
+The test sets of different splits overlap, so the `r J` results are not
+independent and their spread understates the uncertainty. Intervals on this
+page use the corrected resampled $t$ statistic of Nadeau and Bengio (2003),
+which inflates the variance of the mean difference $\bar d$ over $J$ splits to
+
+$$
+\left( \frac{1}{J} + \frac{n_{\text{test}}}{n_{\text{train}}} \right) s_d^2 ,
+$$
+
+where $s_d^2$ is the sample variance of the differences across splits.
+
+```{r helpers}
+nb_interval <- function(d, ratio = 1 / 3) {
+  se <- sqrt((1 / length(d) + ratio) * var(d))
+  q <- qt(0.975, length(d) - 1)
+  c(mean = mean(d), lo = mean(d) - q * se, hi = mean(d) + q * se)
+}
+S <- simplify2array(lapply(sp, `[[`, "scores"))   # model x metric x split
+```
+
+## Predictive performance
+
+```{r scores}
+lab <- c(constant = "Constant", rule = "Rule PAY_1 >= 2",
+         logit_raw = "Logistic, raw", logit_engineered = "Logistic, engineered",
+         xgb_raw = "XGBoost, raw", xgb_engineered = "XGBoost, engineered")
+ms <- function(v, f) sprintf("%s (%s to %s)", f(mean(v)), f(min(v)), f(max(v)))
+knitr::kable(data.frame(
+  model = lab,
+  `test log loss, mean (min to max)` = sapply(names(lab), function(m) ms(S[m, "log_loss", ], f4)),
+  `test AUC, mean (min to max)` = sapply(names(lab), function(m) ms(S[m, "auc", ], f3)),
+  check.names = FALSE
+), row.names = FALSE, align = "lrr")
+```
+
+```{r comparisons}
+comp <- list(
+  c("logit_engineered", "logit_raw"),
+  c("xgb_engineered", "xgb_raw"),
+  c("xgb_engineered", "logit_engineered"),
+  c("logit_engineered", "rule")
+)
+ct <- t(sapply(comp, function(cc) {
+  d <- S[cc[1], "log_loss", ] - S[cc[2], "log_loss", ]
+  c(nb_interval(d), wins = sum(d < 0))
+}))
+knitr::kable(data.frame(
+  comparison = sapply(comp, function(cc) paste(lab[cc[1]], "vs", lab[cc[2]])),
+  `mean difference in log loss` = sprintf("%+.4f", ct[, "mean"]),
+  `95% interval` = sprintf("[%+.4f, %+.4f]", ct[, "lo"], ct[, "hi"]),
+  `splits where the first is better` = sprintf("%d of %d", ct[, "wins"], J),
+  check.names = FALSE
+), row.names = FALSE, align = "lrrr")
+```
+
+The conclusions of parts 2 and 3 hold across splits, and every interval in the
+table excludes zero. The engineered features improve the logistic regression by about `r f3(-ct[1, "mean"])` in log loss and
+boosting by about `r f3(-ct[2, "mean"])`, and boosting beats the logistic
+regression on the engineered features by about `r f3(-ct[3, "mean"])`. The
+boosting gain from the engineered features is the smallest effect on the page
+and the only one that reverses on a split (`r J - ct[2, "wins"]` of `r J`).
+
+## Simulated value
+
+```{r value}
+r_grid <- sp[[1]]$r_grid
+V <- simplify2array(lapply(sp, `[[`, "value"))   # r x policy x split
+D <- V[, "xgb", ] - V[, "logit", ]                 # r x split
+low <- r_grid < 0.15
+mid <- r_grid > 0.2 & r_grid < 0.6
+reg <- rbind(
+  low = nb_interval(colMeans(D[low, , drop = FALSE])),
+  mid = nb_interval(colMeans(D[mid, , drop = FALSE]))
+)
+wins <- c(low = sum(colMeans(D[low, , drop = FALSE]) > 0), mid = sum(colMeans(D[mid, , drop = FALSE]) > 0))
+pts <- function(v) sprintf("%+.1f", 100 * v)
+```
+
+Part 4 found that XGBoost is worth more than the logistic regression when
+acting is cheap ($r < 0.15$) and slightly less in the middle of the range
+($0.2 < r < 0.6$), with regions drawn after looking at the test set. The same
+regions, now fixed in advance, give on the new splits:
+
+| region | XGBoost minus logistic, mean | 95% interval | splits where XGBoost is ahead |
+|---|---|---|---|
+| $r < 0.15$ | `r pts(reg["low", "mean"])` points | [`r pts(reg["low", "lo"])`, `r pts(reg["low", "hi"])`] | `r wins["low"]` of `r J` |
+| $0.2 < r < 0.6$ | `r pts(reg["mid", "mean"])` points | [`r pts(reg["mid", "lo"])`, `r pts(reg["mid", "hi"])`] | `r wins["mid"]` of `r J` |
+
+```{r value-plot, fig.height = 3.8}
+dl <- data.frame(r = rep(r_grid, J), diff = as.vector(D), split = rep(seq_len(J), each = length(r_grid)))
+dm <- data.frame(r = r_grid, diff = rowMeans(D))
+ggplot(dl, aes(r, diff)) +
+  annotate("rect", xmin = 0.2, xmax = 0.6, ymin = -Inf, ymax = Inf, fill = "grey92") +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(aes(group = split), colour = palette_main["light"], linewidth = 0.4) +
+  geom_line(data = dm, colour = palette_main["dark"], linewidth = 0.9) +
+  scale_x_log10(breaks = c(0.05, 0.1, 0.25, 0.5, 1)) +
+  scale_y_continuous(labels = percent_axis) +
+  labs(title = "XGBoost minus logistic regression, simulated value captured",
+       subtitle = paste0("Thin lines: ", J, " splits; thick line: mean; shaded: middle region"),
+       x = "Cost ratio r (log scale)", y = NULL) +
+  theme_report()
+```
+
+```{r verdict, include = FALSE}
+low_holds <- reg["low", "lo"] > 0
+mid_holds <- reg["mid", "hi"] < 0
+```
+
+`r if (low_holds) "The advantage of XGBoost at low cost ratios is confirmed: it holds on average across splits with an interval that excludes zero." else "The advantage of XGBoost at low cost ratios is not confirmed with confidence: the interval across splits includes zero."`
+`r if (mid_holds) "In the middle range the logistic regression is again ahead, and the interval excludes zero." else paste0("In the middle range the lead of the logistic regression found in part 4 does not survive: no statistically detectable difference in simulated value was found between the two models in this region. This is not a proof of equivalence, which would need a margin fixed in advance, but the interval rules out differences larger than about ", sprintf('%.1f', 100 * max(abs(reg['mid', c('lo', 'hi')]))), " points.")`
+`r if (!mid_holds) "Part 4 was a single test set, and this is the kind of result that a second look is for." else ""`
+
+## What this changes
+
+```{r summary-numbers}
+xl <- ct[3, ]
+```
+
+The ranking by predictive quality is stable: engineered features over raw ones,
+boosting over the logistic regression, and both far ahead of the rule. The
+economic comparison is more fragile, which is expected, since it depends only on
+the clients near one threshold rather than on all of them. The conclusion that
+survives is the one stated as a business choice in part 4: at low cost ratios
+boosting is the better candidate, and in the middle of the range no difference
+in simulated value between the two models could be detected.
+
+## Scope of this check
+
+The ten splits reuse the same 30,000 clients, including those of the original
+test set, and the two cost regions were defined after the analysis of part 4.
+This is a check of how stable the results are to the choice of split, not a
+validation on new data. That would require clients from another period or
+another bank, which this data set does not contain.
