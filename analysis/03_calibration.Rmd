@@ -1,0 +1,208 @@
+---
+title: "3. Calibration, class imbalance and test set"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7.5, fig.height = 3.8, dpi = 150)
+```
+
+```{r load}
+source("R/metrics.R")
+source("R/imbalance.R")
+source("R/plotting.R")
+imb <- readRDS("results/imbalance.rds")
+tst <- readRDS("results/test.rds")
+cv <- readRDS("results/cv.rds")
+y_tr <- imb$y
+w <- imb$w
+f3 <- function(v) sprintf("%.3f", v)
+f4 <- function(v) sprintf("%.4f", v)
+pct <- function(v, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * v)
+```
+
+The numbers on this page come from `scripts/run_test.R`.
+
+## Are the probabilities calibrated?
+
+A model is calibrated if, among the clients it gives a probability $p$, a share
+$p$ default. Part 4 turns probabilities into decisions by comparing them with a
+cost ratio, so this matters more here than the ranking. Two checks are used: a
+reliability diagram, which bins clients by predicted probability, and the
+calibration intercept and slope, obtained by regressing the outcome on the
+predicted log-odds,
+
+$$
+\operatorname{logit} \mathbb{P}(Y = 1 \mid p) = a + b \operatorname{logit}(p).
+$$
+
+A calibrated model has $a = 0$ and $b = 1$. A slope below one means the
+predictions are too extreme, above one too timid.
+
+```{r calib-table}
+cal_row <- function(y, p) {
+  cf <- calibration_fit(y, p)
+  c(mean_p = mean(p), rate = mean(y), cf)
+}
+ct <- rbind(
+  `Logistic regression` = cal_row(y_tr, tst$oof$logit),
+  `XGBoost` = cal_row(y_tr, tst$oof$xgb)
+)
+knitr::kable(data.frame(
+  model = rownames(ct),
+  `mean prediction` = pct(ct[, "mean_p"]),
+  `default rate` = pct(ct[, "rate"]),
+  intercept = sprintf("%+.3f", ct[, "intercept"]),
+  slope = f3(ct[, "slope"]),
+  check.names = FALSE
+), row.names = FALSE, align = "lrrrr")
+```
+
+Both models, fitted without any reweighting, are calibrated out of fold.
+No recalibration step (Platt scaling, isotonic regression) is needed, and
+adding one would only spend data.
+
+## Rebalancing the classes
+
+`r pct(mean(y_tr))` of the clients default. A common reaction is to rebalance
+the training data, either by weighting the defaults by
+$w = n_0 / n_1 = `r sprintf("%.2f", w)`$ or by creating synthetic defaults with
+SMOTE until the two classes are the same size. Both were tried on the selected
+XGBoost configuration, inside the cross-validation folds so that synthetic
+clients never reach a validation fold. SMOTE is used in its SMOTE-NC form:
+continuous features are interpolated between neighbours, while counts, flags
+and months of delay are copied from one of the two clients, since a client
+cannot be 2.4 months late.
+
+```{r imb-table}
+lab <- c(none = "No rebalancing", weights = "Class weights", smote = "SMOTE-NC")
+it <- t(sapply(colnames(imb$oof), function(v) {
+  p <- imb$oof[, v]
+  c(scores(y_tr, p), mean_p = mean(p), calibration_fit(y_tr, p))
+}))
+pc <- t(sapply(c("weights", "smote"), function(v) scores(y_tr, prior_correct(imb$oof[, v], w))))
+knitr::kable(data.frame(
+  training = lab[rownames(it)],
+  `mean prediction` = pct(it[, "mean_p"]),
+  `log loss` = f4(it[, "log_loss"]),
+  AUC = f3(it[, "auc"]),
+  `calibration intercept` = sprintf("%+.2f", it[, "intercept"]),
+  `log loss after correction` = c("", f4(pc[, "log_loss"])),
+  check.names = FALSE
+), row.names = FALSE, align = "lrrrrr")
+```
+
+Rebalancing does not help the model tell good and bad clients apart: class
+weights leave the AUC unchanged and SMOTE lowers it. What it does is move every
+probability up. With class weights the mean prediction is
+`r pct(it["weights", "mean_p"])` for a default rate of `r pct(mean(y_tr))`,
+and the log loss is as bad as that of the constant model
+(`r f4(log_loss(y_tr, rep(mean(y_tr), length(y_tr))))`).
+
+The shift is predictable. Weighting the defaults by $w$ multiplies the odds the
+model estimates by $w$, so the original probabilities are recovered by
+
+$$
+\tilde p = \frac{p}{p + w (1 - p)}.
+$$
+
+After this correction the weighted model is as good as the unweighted one: the
+whole effect of the weights was a change of scale. The same correction does not
+fully repair SMOTE, whose synthetic clients are not draws from the population of
+defaulters, and SMOTE stays worse on every measure.
+
+```{r reliability, fig.height = 3.8}
+rel <- function(y, p, panel, curve) cbind(reliability(y, p), panel = panel, curve = curve)
+d <- rbind(
+  rel(y_tr, tst$oof$logit, "Selected models", "Logistic regression"),
+  rel(y_tr, tst$oof$xgb, "Selected models", "XGBoost"),
+  rel(y_tr, imb$oof[, "weights"], "XGBoost with rebalancing", "Class weights"),
+  rel(y_tr, imb$oof[, "smote"], "XGBoost with rebalancing", "SMOTE-NC"),
+  rel(y_tr, prior_correct(imb$oof[, "weights"], w), "XGBoost with rebalancing", "Class weights, corrected")
+)
+d$curve <- factor(d$curve, levels = c("Logistic regression", "XGBoost", "Class weights",
+                                      "SMOTE-NC", "Class weights, corrected"))
+ggplot(d, aes(predicted, observed, colour = curve)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey70", linetype = "dashed") +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 1.4) +
+  facet_wrap(~panel) +
+  scale_colour_manual(values = unname(c(palette_main[c("accent", "dark")], "#d08c3c", "#7f6aa8", palette_main["mid"]))) +
+  scale_x_continuous(labels = percent_axis, limits = c(0, 1)) +
+  scale_y_continuous(labels = percent_axis, limits = c(0, 1)) +
+  coord_equal() +
+  labs(title = "Reliability on the training set, out of fold",
+       subtitle = "Clients grouped in deciles of predicted probability",
+       x = "Mean predicted probability", y = "Observed default rate") +
+  theme_report() +
+  theme(legend.position = "right", panel.spacing = unit(1.5, "lines")) +
+  guides(colour = guide_legend(ncol = 1))
+```
+
+The practical consequence is that rebalancing and the choice of a decision
+threshold do the same job. A model trained with weights $w$ and cut at 0.5
+flags, up to estimation noise, the same clients as the unweighted model cut at
+$1 / (1 + w)$. Doing both,
+as in the original version of this project (SMOTE, then a threshold tuned on
+balanced accuracy), corrects for the imbalance twice. The models below are
+trained on the data as it is, and the threshold is set in part 4 from the costs.
+
+## Test set
+
+The two selected models were refitted on the whole training set with the
+hyperparameters chosen in part 2 and scored once on the
+`r format(length(tst$y), big.mark = ",")` test clients. Nothing on the previous
+pages was changed after this.
+
+```{r test-table}
+yt <- tst$y
+Lt <- sapply(tst$pred, function(p) -(yt * log(p) + (1 - yt) * log(1 - p)))
+set.seed(2)
+idx <- replicate(2000, sample.int(length(yt), replace = TRUE))
+boot_ci <- function(stat) {
+  q <- quantile(apply(idx, 2, stat), c(0.025, 0.975))
+  sprintf("[%.3f, %.3f]", q[1], q[2])
+}
+tl <- c(constant = "Constant", rule = "Rule PAY_1 >= 2", logit = "Logistic regression", xgb = "XGBoost")
+tt <- do.call(rbind, lapply(names(tl), function(m) {
+  p <- tst$pred[[m]]
+  data.frame(
+    model = tl[m],
+    `log loss` = f4(log_loss(yt, p)),
+    `95% interval` = boot_ci(function(i) mean(Lt[i, m])),
+    Brier = f4(brier(yt, p)),
+    AUC = if (m == "constant") "0.500" else f3(auc(yt, p)),
+    `AUC 95% interval` = if (m == "constant") "" else boot_ci(function(i) auc(yt[i], p[i])),
+    check.names = FALSE
+  )
+}))
+knitr::kable(tt, row.names = FALSE, align = "lrrrrr")
+dxl <- Lt[, "xgb"] - Lt[, "logit"]
+dxr <- Lt[, "xgb"] - Lt[, "rule"]
+q_xl <- quantile(apply(idx, 2, function(i) mean(dxl[i])), c(0.025, 0.975))
+q_xr <- quantile(apply(idx, 2, function(i) mean(dxr[i])), c(0.025, 0.975))
+cal_t <- rbind(logit = calibration_fit(yt, tst$pred$logit), xgb = calibration_fit(yt, tst$pred$xgb))
+cv_xgb <- log_loss(y_tr, tst$oof$xgb)
+```
+
+The ranking of part 2 holds on new clients. XGBoost beats the logistic
+regression by `r f4(-mean(dxl))` in log loss (paired 95% interval
+`r sprintf("[%.4f, %.4f]", -q_xl[2], -q_xl[1])`) and the rule by
+`r f4(-mean(dxr))` (`r sprintf("[%.4f, %.4f]", -q_xr[2], -q_xr[1])`). Its test log
+loss is `r f4(log_loss(yt, tst$pred$xgb))`, against `r f4(cv_xgb)` out of fold:
+the gap is the optimism left by tuning on the training folds, plus sampling
+noise, and it is small.
+
+Calibration also carries over. On the test set the calibration slope is
+`r f3(cal_t["xgb", "slope"])` for XGBoost and `r f3(cal_t["logit", "slope"])`
+for the logistic regression, with intercepts of
+`r sprintf("%+.3f", cal_t["xgb", "intercept"])` and
+`r sprintf("%+.3f", cal_t["logit", "intercept"])`.
+
+For comparison, the original version of this project reported an AUC of 0.772
+for XGBoost, on a single split with no tuning and different features. The
+difference with the AUC above is within the sampling noise of a 7,500-client
+test set, which is why the comparisons on this page are paired and why part 5
+repeats the procedure over several splits.
