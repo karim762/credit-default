@@ -173,7 +173,7 @@ can be rendered without running the scripts.
 
 ## Context
 
-The first version of this project was a course project at Polytech Sorbonne:
+The first version of this project was a course project at Sorbonne University:
 descriptive analysis, clustering and a comparison of classifiers chosen on
 balanced accuracy after SMOTE. This version rebuilds it around the quality of
 the probabilities and the decision they support.
