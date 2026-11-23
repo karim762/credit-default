@@ -52,30 +52,36 @@ is move every probability up. With class weights the mean prediction is
 41.3% for a default rate of 22.1%, and the log loss is as bad as that of
 the constant model (0.5284).
 
-The shift is predictable. Weighting the defaults by $w$ multiplies the
-odds the model estimates by $w$, so the original probabilities are
-recovered by
+The shift is largely predictable. If $p$ is the true probability of
+default, the weighted log loss is minimised by
+$q = w p / (w p + 1 - p)$, whose odds are $w$ times larger, and
+inverting gives
 
 $$
-\tilde p = \frac{p}{p + w (1 - p)}.
+\tilde p = \frac{q}{q + w (1 - q)}.
 $$
 
-After this correction the weighted model is as good as the unweighted
-one: the whole effect of the weights was a change of scale. The same
-correction does not fully repair SMOTE, whose synthetic clients are not
-draws from the population of defaulters, and SMOTE stays worse on every
-measure.
+This is exact for the minimiser of the expected loss, not for a fitted
+booster: the weights also change the effect of the minimum child weight,
+of the L2 penalty and of the number of trees, which was chosen without
+weights. Here the correction works well in practice, bringing the
+weighted model to within 0.0005 of the unweighted one, but that is an
+empirical result. It does not repair SMOTE, whose synthetic clients are
+not draws from the population of defaulters, and SMOTE stays worse on
+every measure.
 
 ![](03_calibration_files/figure-gfm/reliability-1.png)<!-- -->
 
-The practical consequence is that rebalancing and the choice of a
-decision threshold do the same job. A model trained with weights $w$ and
-cut at 0.5 flags, up to estimation noise, the same clients as the
-unweighted model cut at $1 / (1 + w)$. Doing both, as in the original
-version of this project (SMOTE, then a threshold tuned on balanced
-accuracy), corrects for the imbalance twice. The models below are
-trained on the data as it is, and the threshold is set in part 4 from
-the costs.
+Class weights and SMOTE act differently. Weights mostly rescale the
+predictions: a model trained with weights $w$ and cut at 0.5 flags
+roughly the same clients as the unweighted model cut at $1 / (1 + w)$.
+SMOTE changes the training data and therefore the model itself, and here
+it makes the ranking worse. In neither case is there anything to gain
+over training on the data as it is and choosing the threshold
+afterwards. Doing both, as in the original version of this project
+(SMOTE, then a threshold tuned on balanced accuracy), compensates for
+the imbalance twice. The models below are trained without rebalancing,
+and the threshold is set in part 4 from the costs.
 
 ## Test set
 
