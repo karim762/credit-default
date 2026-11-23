@@ -273,7 +273,7 @@ histories, but it does not by itself establish that the model is fair or that
 the gap is unavoidable. What the literature does establish is a constraint:
 when base rates differ, a score that is calibrated within each group cannot
 also give equal false positive rates and equal true positive rates
-(Chouldechova, 2017; Kleinberg, Mullainathan and Raghavan, 2016). A bank has to
+(Chouldechova, 2017; Kleinberg, Mullainathan and Raghavan, 2017). A bank has to
 decide which of these properties to protect, and a gap such as this one is a
 reason to investigate which features drive it, not a result to accept as it
 stands. Group-specific thresholds would equalise false alarms, but they would
