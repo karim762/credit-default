@@ -22,8 +22,7 @@ prep_logit_fit <- function(df, df_spline = 4, min_unique = 12) {
     # a mass point (a ratio of exactly 1, a balance of 0) that would otherwise
     # pull every knot onto the same value
     inner <- quantile(unique(w), seq_len(df_spline - 1) / df_spline, names = FALSE)
-    basis <- splines::ns(w, knots = inner, Boundary.knots = lim)
-    list(type = "spline", lim = lim, basis = basis)
+    list(type = "spline", lim = lim, knots = inner)
   })
 }
 
@@ -32,7 +31,7 @@ prep_logit_apply <- function(prep, df) {
     m <- switch(p$type,
       factor = sapply(p$levels[-1], function(l) as.numeric(v == l)),
       plain  = matrix(as.numeric(v)),
-      spline = predict(p$basis, pmin(pmax(v, p$lim[1]), p$lim[2]))
+      spline = splines::ns(pmin(pmax(v, p$lim[1]), p$lim[2]), knots = p$knots, Boundary.knots = p$lim)
     )
     m <- matrix(m, nrow = length(v))
     colnames(m) <- if (ncol(m) == 1) name else paste0(name, "_", if (p$type == "factor") p$levels[-1] else seq_len(ncol(m)))
