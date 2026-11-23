@@ -1,0 +1,292 @@
+---
+title: "6. What the models learned, and who they flag"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7.5, fig.height = 4, dpi = 150)
+```
+
+```{r load}
+source("R/features.R")
+source("R/metrics.R")
+source("R/models.R")
+source("R/decision.R")
+source("R/interpret.R")
+source("R/imbalance.R")
+source("R/plotting.R")
+x <- readRDS("data/credit.rds")
+cv <- readRDS("results/cv.rds")
+tst <- readRDS("results/test.rds")
+abl <- readRDS("results/ablation.rds")$behaviour_only
+te <- x[cv$is_test, ]
+f_te <- build_features(te)
+yt <- tst$y
+y_tr <- cv$y
+logit <- readRDS("results/logit_final.rds")
+xgbm <- xgb.load("results/xgb_final.ubj")
+X_te <- xgb_matrix(f_te)
+shap <- shap_by_feature(xgbm, X_te, feature_groups(f_te))
+pct <- function(v, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * v)
+f4 <- function(v) sprintf("%.4f", v)
+```
+
+Both models are read on the test clients. For the logistic regression, the
+contribution of a feature is its term in the log-odds. For XGBoost it is its
+SHAP value (Lundberg and Lee, 2017), which splits each prediction, on the
+log-odds scale, into a sum of contributions of the features. Both are on the
+log-odds scale, but they do not share out the credit in the same way: for an
+additive model the centred term is exactly the SHAP value, while for boosted
+trees the credit given to correlated features depends on how the trees use
+them. The comparisons below are therefore qualitative, about which features
+matter and in which direction, not an exact match of importances. Neither
+method says anything causal: they describe what the models use, not what makes
+a client default.
+
+## Which features matter
+
+```{r logit-contrib}
+# contribution of each feature to the log-odds of the logistic regression
+b <- as.matrix(coef(logit$fit, s = logit$lambda))[, 1]
+lc <- sapply(names(logit$prep), function(fn) {
+  Xf <- prep_logit_apply(logit$prep[fn], f_te[fn])
+  drop(Xf %*% b[colnames(Xf)])
+})
+lc <- sweep(lc, 2, colMeans(lc))
+kept <- sum(b[-1] != 0)
+```
+
+```{r importance, fig.height = 5}
+imp <- rbind(
+  data.frame(feature = colnames(shap), share = colMeans(abs(shap)) / sum(colMeans(abs(shap))), model = "XGBoost"),
+  data.frame(feature = colnames(lc), share = colMeans(abs(lc)) / sum(colMeans(abs(lc))), model = "Logistic regression")
+)
+ord <- names(sort(tapply(imp$share, imp$feature, mean)))
+imp$feature <- factor(imp$feature, levels = ord)
+ggplot(imp, aes(share, feature, colour = model)) +
+  geom_line(aes(group = feature), colour = "grey80") +
+  geom_point(size = 2) +
+  scale_colour_manual(values = unname(palette_main[c("accent", "dark")])) +
+  scale_x_continuous(labels = percent_axis) +
+  labs(title = "Share of the average absolute contribution to the log-odds",
+       subtitle = "Test set; features of part 1",
+       x = NULL, y = NULL) +
+  theme_report() +
+  theme(panel.grid.major.y = element_line(colour = "grey94"))
+```
+
+```{r top}
+top_x <- names(sort(colMeans(abs(shap)), decreasing = TRUE))[1:5]
+delinq <- c("delay_1", "max_delay", "months_late", "status_1", "months_no_pay", "worsening")
+share_delinq <- sum(colMeans(abs(shap))[delinq]) / sum(colMeans(abs(shap)))
+```
+
+The two models agree on what comes first. The delinquency history
+(`delay_1`, `max_delay`, `months_late`, `status_1`, `months_no_pay`,
+`worsening`) accounts for `r pct(share_delinq, 0)` of XGBoost's contributions.
+The credit limit comes next: the bank's own past assessment of the client is one
+of the strongest signals available. Beyond these, the logistic regression spreads more weight over the repayment
+ratios and utilisation, which carry part of the same information as the
+delinquency features, while XGBoost leans more on the delay counts. The lasso
+kept `r kept` of the `r length(b) - 1` columns of the logistic
+regression, so the penalty mostly shrinks rather than selects.
+
+## The shape of each effect
+
+For the continuous features the logistic regression fits a spline, so its
+effects are curves too. The figure compares, for six features, the average
+contribution in each decile of the feature, for both models.
+
+```{r shapes, fig.height = 5.2}
+feats <- c("log_limit", "util_mean", "repay_mean", "spend_mean", "util_slope", "age")
+d <- do.call(rbind, lapply(feats, function(fn) {
+  v <- f_te[[fn]]
+  bin <- cut(v, unique(quantile(v, seq(0, 1, 0.1))), include.lowest = TRUE)
+  rbind(
+    data.frame(feature = fn, model = "Logistic regression",
+               value = tapply(v, bin, mean), contrib = tapply(lc[, fn], bin, mean)),
+    data.frame(feature = fn, model = "XGBoost",
+               value = tapply(v, bin, mean), contrib = tapply(shap[, fn], bin, mean))
+  )
+}))
+d$feature <- factor(d$feature, levels = feats)
+ggplot(d, aes(value, contrib, colour = model)) +
+  geom_hline(yintercept = 0, colour = "grey75") +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 1.2) +
+  facet_wrap(~feature, scales = "free_x", ncol = 3) +
+  scale_colour_manual(values = unname(palette_main[c("accent", "dark")])) +
+  labs(title = "Contribution to the log-odds of default, by decile of the feature",
+       subtitle = "Test set; positive values raise the predicted probability",
+       x = NULL, y = "Contribution (log-odds)") +
+  theme_report()
+```
+
+What the curves say:
+
+- **Credit limit.** The higher the limit, the lower the risk, steadily over the
+  whole range. Part of this is the bank's earlier assessment of the client,
+  which the model inherits.
+- **Utilisation.** A U shape. Accounts that are barely used are riskier than
+  those at around 20% of their limit, in line with the higher default rate of
+  clients with nothing owed found in part 1. Above that, risk rises with
+  utilisation: clients close to their limit have little room left.
+- **Repayment ratio.** Both models put most of the effect at the low end:
+  repaying only a few percent of the statement is the signal. Beyond that the
+  logistic regression keeps rewarding higher repayment while XGBoost is flat,
+  presumably because its delinquency features already carry that information.
+- **New charges.** Clients who keep adding to their balance are safer, as found
+  in part 1, where the reading as a consequence of delinquency rather than a
+  cause was discussed.
+- **Utilisation trend.** A balance that grows relative to the limit over the
+  six months raises the risk.
+- **Age.** A small effect: clients in their thirties get the lowest risk, and
+  older clients a slightly higher one.
+
+The two models draw broadly the same shapes. XGBoost's advantage in log loss
+therefore presumably comes less from different effects than from interactions
+between features, which the additive logistic regression cannot represent.
+
+## Personal attributes
+
+Education, marital status and age are inputs; sex is not. Their contribution is
+small, and the models lose little without them. Both models were refitted on
+account-level and credit-related features only, excluding these three personal
+attributes, with the same hyperparameters:
+
+```{r ablation}
+L <- function(y, p) -(y * log(p) + (1 - y) * log(1 - p))
+set.seed(4)
+paired <- function(y, p1, p0, B = 2000) {
+  d <- L(y, p1) - L(y, p0)
+  q <- quantile(replicate(B, mean(d[sample.int(length(d), replace = TRUE)])), c(0.025, 0.975))
+  sprintf("%+.4f [%+.4f, %+.4f]", mean(d), q[1], q[2])
+}
+knitr::kable(data.frame(
+  model = c("Logistic regression", "XGBoost"),
+  `out of fold, training set` = c(paired(y_tr, abl$oof$logit, tst$oof$logit), paired(y_tr, abl$oof$xgb, tst$oof$xgb)),
+  `test set` = c(paired(yt, abl$test$logit, tst$pred$logit), paired(yt, abl$test$xgb, tst$pred$xgb)),
+  check.names = FALSE
+), row.names = FALSE, align = "lrr",
+caption = "Change in log loss when education, marital status and age are removed, with 95% paired bootstrap intervals")
+```
+
+The loss is about a thousandth of log loss, a tenth of the gap between the two
+models. There is also a reason beyond accuracy to drop them. Under the US Equal
+Credit Opportunity Act, for example, marital status is a prohibited basis for a
+credit decision, and age may enter a scoring system only if elderly applicants
+are not assigned a negative value. Here older clients receive a slightly higher
+risk than those in their thirties, which would have to be checked against such a
+rule. This is one jurisdiction among others, and the rules that applied to
+this Taiwanese bank are not assessed here. In general, a model restricted to
+account-level and credit-related features is easier to defend, and on this
+data it costs almost nothing. It is not free of history either: the credit
+limit is itself an earlier decision of the bank.
+
+## Decisions by sex
+
+Sex is not an input, but other features can act as proxies for it. The check is
+on the decisions themselves, at the middle cost ratio $r = 0.25$
+(threshold `r pct(cost_threshold(0.25), 0)`), for the main model and for the model without personal attributes.
+
+```{r fairness}
+t25 <- cost_threshold(0.25)
+sex <- ifelse(te$SEX == 1, "men", "women")
+group_stats <- function(p) {
+  do.call(rbind, lapply(c("men", "women"), function(g) {
+    s <- sex == g
+    a <- p[s] > t25
+    data.frame(
+      group = g,
+      clients = format(sum(s), big.mark = ","),
+      `default rate` = pct(mean(yt[s])),
+      `mean prediction` = pct(mean(p[s])),
+      `acted on` = pct(mean(a)),
+      `good clients acted on` = pct(mean(a[yt[s] == 0])),
+      `defaulters caught` = pct(mean(a[yt[s] == 1])),
+      check.names = FALSE
+    )
+  }))
+}
+knitr::kable(cbind(model = rep(c("XGBoost", "XGBoost, no personal attributes"), each = 2),
+                   rbind(group_stats(tst$pred$xgb), group_stats(abl$test$xgb))),
+             row.names = FALSE, align = "llrrrrrr")
+
+set.seed(5)
+gap <- function(p, B = 2000) {
+  a <- p > t25
+  stat <- function(i) {
+    m <- sex[i] == "men"; good <- yt[i] == 0
+    mean(a[i][m & good]) - mean(a[i][!m & good])
+  }
+  q <- quantile(replicate(B, stat(sample.int(length(yt), replace = TRUE))), c(0.025, 0.975))
+  c(est = stat(seq_along(yt)), lo = q[[1]], hi = q[[2]])
+}
+g_full <- gap(tst$pred$xgb)
+g_beh <- gap(abl$test$xgb)
+tpr <- tapply(tst$pred$xgb[yt == 1] > t25, sex[yt == 1], mean)
+```
+
+The models catch the same share of defaulters among men and women
+(`r pct(tpr["men"], 0)` and `r pct(tpr["women"], 0)`). Men who would have
+repaid are acted on more often than women who would have repaid: the gap is
+`r sprintf("%.1f", 100 * g_full["est"])` points
+(95% interval `r sprintf("[%.1f, %.1f]", 100 * g_full["lo"], 100 * g_full["hi"])`)
+for the main model and `r sprintf("%.1f", 100 * g_beh["est"])` points
+(`r sprintf("[%.1f, %.1f]", 100 * g_beh["lo"], 100 * g_beh["hi"])`) without the
+personal attributes, so removing them does not close it.
+
+```{r group-calibration}
+cal_group <- function(p) {
+  do.call(rbind, lapply(c("men", "women"), function(g) {
+    s <- sex == g
+    est <- calibration_fit(yt[s], p[s])
+    bs <- replicate(1000, {
+      i <- sample(which(s), replace = TRUE)
+      calibration_fit(yt[i], p[i])
+    })
+    q <- apply(bs, 1, quantile, c(0.025, 0.975))
+    data.frame(group = g,
+               intercept = sprintf("%+.2f [%+.2f, %+.2f]", est[1], q[1, 1], q[2, 1]),
+               slope = sprintf("%.2f [%.2f, %.2f]", est[2], q[1, 2], q[2, 2]))
+  }))
+}
+set.seed(6)
+knitr::kable(cal_group(tst$pred$xgb), row.names = FALSE, align = "lrr",
+             caption = "Calibration intercept and slope of XGBoost within each group, test set, with 95% bootstrap intervals")
+```
+
+Within each group the calibration can be checked as in part 3. An intercept
+above zero means the model predicts too little default for that group. The
+model is not calibrated for men: their intercept is above zero with an interval
+that excludes it, so the model slightly underestimates their risk. It is
+calibrated for women. The extra false alarms for men therefore do not come from
+the model overstating their risk; they come from the larger share of men whose
+histories look risky, defaulters or not.
+
+Men in this portfolio default more often (`r pct(mean(yt[sex == "men"]))`
+against `r pct(mean(yt[sex == "women"]))`), and their account histories differ.
+The observed disparity may reflect differences in base rates and account
+histories, but it does not by itself establish that the model is fair or that
+the gap is unavoidable. What the literature does establish is a constraint:
+when base rates differ, a score that is calibrated within each group cannot
+also give equal false positive rates and equal true positive rates
+(Chouldechova, 2017; Kleinberg, Mullainathan and Raghavan, 2016). A bank has to
+decide which of these properties to protect, and a gap such as this one is a
+reason to investigate which features drive it, not a result to accept as it
+stands. Group-specific thresholds would equalise false alarms, but they would
+make the decision depend on sex explicitly, which is itself prohibited in many
+jurisdictions.
+
+## Limits
+
+- SHAP values and spline terms describe the model, not the clients. A large
+  contribution of the credit limit does not mean that raising a limit lowers
+  risk.
+- The fairness check covers sex only. Age bands and other groups could be
+  checked the same way.
+- Contributions are averaged over the test set and say little about any single
+  client. Explaining an individual decision, as a declined applicant may be
+  entitled to, would use the client's own contributions.
