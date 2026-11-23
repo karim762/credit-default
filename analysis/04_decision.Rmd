@@ -1,0 +1,294 @@
+---
+title: "4. From probabilities to decisions"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7.5, fig.height = 3.8, dpi = 150)
+```
+
+```{r load}
+source("R/metrics.R")
+source("R/decision.R")
+source("R/plotting.R")
+x <- readRDS("data/credit.rds")
+cv <- readRDS("results/cv.rds")
+tst <- readRDS("results/test.rds")
+y_tr <- cv$y
+y_te <- tst$y
+E_tr <- pmax(x$BILL_AMT1[!cv$is_test], 0)
+E_te <- pmax(x$BILL_AMT1[cv$is_test], 0)
+late_te <- x$PAY_1[cv$is_test] >= 2
+pi_tr <- mean(y_tr)
+pct <- function(v, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * v)
+f3 <- function(v) sprintf("%.3f", v)
+```
+
+A score is only useful once it changes what the bank does. This page sets the
+decision rule from the costs, checks it against the data, and compares the
+models by the economic value they would produce under a stylised model of the
+bank's intervention. The value is simulated, not observed: the data record what
+happened without intervention, and what a client would have done after a limit
+cut or a frozen card cannot be seen.
+
+## Decision rule
+
+In September the bank can either keep an account as it is or act on it: cut
+the limit, freeze the card, start collection early. In this stylised model,
+acting is assumed to remove the exposure, so it neither earns nor loses
+anything. This is optimistic: freezing a card stops new spending but does not
+erase the balance already owed. Keeping the account earns
+a margin if the client repays and loses the defaulted amount otherwise. Per unit
+of exposure, with the loss given default as the unit of cost:
+
+| | client repays | client defaults |
+|---|---|---|
+| keep | $+r$ | $-1$ |
+| act | $0$ | $0$ |
+
+The cost ratio $r$ is what the bank gives up by acting on a good client,
+relative to what a default costs. A client with default probability $p$ is
+worth $(1 - p)\,r - p$ per unit of exposure if kept, so the bank should act when
+
+$$
+p > t(r) = \frac{r}{1 + r}.
+$$
+
+The exposure cancels out: the threshold is the same for every client, and only
+the probability matters. This is where calibration enters. A model whose 20%
+does not mean 20% would apply the wrong threshold, however well it ranks
+clients.
+
+The exposure is the September balance, set to zero when it is negative. The
+model is deliberately simple: acting rarely removes the whole exposure, and a
+good client who is acted on may be lost for longer than a month. Both effects
+change $r$ rather than the form of the rule, so results are given over a range
+of $r$ instead of for a single guess.
+
+Three values of $r$ are used as reference points:
+
+| $r$ | threshold | reading |
+|---|---|---|
+| 0.10 | `r pct(cost_threshold(0.10))` | a default costs ten times as much as losing a good client |
+| 0.25 | `r pct(cost_threshold(0.25))` | four times as much |
+| 0.50 | `r pct(cost_threshold(0.50))` | twice as much |
+
+## Does the theory hold on the data?
+
+If the probabilities are calibrated, the threshold that maximises the value on
+past data should be close to $t(r)$. The table compares the two on the training
+set, out of fold, searching thresholds on a grid of step 0.005.
+
+```{r empirical-threshold}
+rs <- c(0.10, 0.25, 0.50)
+et <- t(sapply(rs, function(r) c(
+  r = r,
+  theory = cost_threshold(r),
+  logit = best_threshold(y_tr, tst$oof$logit, E_tr, r),
+  xgb = best_threshold(y_tr, tst$oof$xgb, E_tr, r)
+)))
+knitr::kable(data.frame(
+  `cost ratio r` = sprintf("%.2f", et[, "r"]),
+  `t(r)` = f3(et[, "theory"]),
+  `best threshold, logistic` = f3(et[, "logit"]),
+  `best threshold, XGBoost` = f3(et[, "xgb"]),
+  check.names = FALSE
+), row.names = FALSE, align = "rrrr")
+```
+
+The best thresholds found on the data are within a few points of the
+theoretical ones, and none is systematically above or below. The thresholds
+below are therefore set from $r$ alone, and nothing is tuned on the test set.
+
+The balanced accuracy and Youden's index used in the original version of this
+project are a special case. Maximising balanced accuracy gives a missed default
+a weight $1/n_1$ and a false alarm a weight $1/n_0$, which is the cost ratio
+$r = n_1 / n_0 = `r f3(pi_tr / (1 - pi_tr))`$ and, for a calibrated model, the
+threshold $t = \pi = `r f3(pi_tr)`$, the default rate. Youden's threshold is
+not neutral: it fixes the costs implicitly, and they are counted per client
+rather than per unit of exposure.
+
+## Simulated value on the test set
+
+```{r value-setup}
+policies <- function(r) {
+  t <- cost_threshold(r)
+  cbind(
+    keep_all = rep(FALSE, length(y_te)),
+    act_all = rep(TRUE, length(y_te)),
+    rule = late_te,
+    logit = tst$pred$logit > t,
+    xgb = tst$pred$xgb > t,
+    oracle = y_te == 1
+  )
+}
+contrib <- function(r) {
+  A <- policies(r)
+  apply(A, 2, function(act) (!act) * ((1 - y_te) * r - y_te) * E_te)
+}
+set.seed(3)
+B <- 1000
+W <- rmultinom(B, length(y_te), rep(1, length(y_te)))   # bootstrap counts, n x B
+
+# Value of each policy as a share of what perfect foresight adds over the better
+# of the two policies that need no model (keep everyone, act on everyone).
+captured <- function(V) {
+  base <- pmax(V[, "keep_all"], V[, "act_all"])
+  (V[, c("rule", "logit", "xgb"), drop = FALSE] - base) / (V[, "oracle"] - base)
+}
+```
+
+Each policy is scored by its simulated value relative to two references. The floor is
+the better of the two policies that need no model, keeping everyone or acting on
+everyone, since a model has to beat both. The ceiling is perfect foresight:
+acting on exactly the clients who will default. The share of the distance
+between floor and ceiling that a policy covers is reported, with a 95% bootstrap
+interval over test clients.
+
+```{r value-table}
+lab <- c(rule = "Rule PAY_1 >= 2", logit = "Logistic regression", xgb = "XGBoost")
+vt <- do.call(rbind, lapply(rs, function(r) {
+  C <- contrib(r)
+  point <- captured(matrix(colSums(C), nrow = 1, dimnames = list(NULL, colnames(C))))
+  boot <- captured(t(W) %*% C)
+  A <- policies(r)
+  data.frame(
+    r = sprintf("%.2f", r),
+    policy = lab,
+    `clients acted on` = pct(colMeans(A[, names(lab)])),
+    `precision` = pct(sapply(names(lab), function(m) mean(y_te[A[, m]]))),
+    `recall` = pct(sapply(names(lab), function(m) sum(A[, m] & y_te == 1) / sum(y_te))),
+    `value captured` = pct(point[1, ]),
+    `95% interval` = sapply(names(lab), function(m) {
+      q <- quantile(boot[, m], c(0.025, 0.975)); sprintf("[%s, %s]", pct(q[1]), pct(q[2]))
+    }),
+    check.names = FALSE
+  )
+}))
+knitr::kable(vt, row.names = FALSE, align = "rlrrrrr")
+```
+
+Precision and recall are in the table only as a description. They are not
+chosen: they follow from the cost ratio. Asking whether a precision of 35% is
+acceptable has no answer until $r$ is known, and once it is known the threshold
+follows.
+
+```{r sensitivity, fig.width = 9, fig.height = 4.2}
+r_grid <- exp(seq(log(0.05), log(1), length.out = 40))
+curves <- lapply(r_grid, function(r) {
+  C <- contrib(r)
+  point <- captured(matrix(colSums(C), nrow = 1, dimnames = list(NULL, colnames(C))))
+  boot <- t(W) %*% C
+  cb <- captured(boot)
+  d <- cb[, "xgb"] - cb[, "logit"]
+  list(
+    boot_diff = d,
+    curve = data.frame(r = r, policy = lab, value = point[1, ],
+                       lo = apply(cb, 2, quantile, 0.025), hi = apply(cb, 2, quantile, 0.975)),
+    diff = data.frame(r = r, value = point[1, "xgb"] - point[1, "logit"],
+                      lo = quantile(d, 0.025), hi = quantile(d, 0.975))
+  )
+})
+cd <- do.call(rbind, lapply(curves, `[[`, "curve"))
+dd <- do.call(rbind, lapply(curves, `[[`, "diff"))
+cd$policy <- factor(cd$policy, levels = lab)
+cols <- setNames(unname(palette_main[c("grey", "accent", "dark")]), lab)
+
+p1 <- ggplot(cd, aes(r, value, colour = policy, fill = policy)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 0.7) +
+  geom_vline(xintercept = pi_tr / (1 - pi_tr), linetype = "dotted", colour = "grey40") +
+  annotate("text", x = pi_tr / (1 - pi_tr), y = -0.25, label = "Youden", hjust = -0.1, size = 3, colour = "grey35") +
+  scale_x_log10(breaks = c(0.05, 0.1, 0.25, 0.5, 1)) +
+  scale_y_continuous(labels = percent_axis) +
+  scale_colour_manual(values = cols) + scale_fill_manual(values = cols) +
+  coord_cartesian(ylim = c(-0.3, 0.7)) +
+  labs(title = "Simulated value captured on the test set",
+       subtitle = "Share of the gap between no model and perfect foresight",
+       x = "Cost ratio r (log scale)", y = NULL) +
+  theme_report()
+
+p2 <- ggplot(dd, aes(r, value)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = palette_main["light"], alpha = 0.6) +
+  geom_line(colour = palette_main["dark"], linewidth = 0.7) +
+  scale_x_log10(breaks = c(0.05, 0.1, 0.25, 0.5, 1)) +
+  scale_y_continuous(labels = percent_axis) +
+  labs(title = "XGBoost minus logistic",
+       subtitle = "Paired 95% interval",
+       x = "Cost ratio r (log scale)", y = NULL) +
+  theme_report()
+
+patchwork::wrap_plots(p1, p2, widths = c(1.5, 1))
+```
+
+```{r numbers}
+low <- dd$r < 0.15
+mid <- dd$r > 0.2 & dd$r < 0.6
+BD <- sapply(curves, `[[`, "boot_diff")   # bootstrap replicates x cost ratios
+region <- function(sel) {
+  q <- quantile(rowMeans(BD[, sel, drop = FALSE]), c(0.025, 0.975))
+  c(mean = mean(dd$value[sel]), lo = q[[1]], hi = q[[2]])
+}
+reg_low <- region(low)
+reg_mid <- region(mid)
+pts <- function(v) sprintf("%+.1f", 100 * v)
+```
+
+Three findings.
+
+**The models beat the policies that need none over almost the whole range.**
+They capture up to `r pct(max(cd$value[cd$policy != lab["rule"]]), 0)` of what
+perfect foresight would add, most near the middle of the range, where keeping
+everyone and acting on everyone are both poor. The rule `PAY_1 >= 2` acts on
+the same `r pct(mean(late_te))` of clients whatever the costs, and when
+defaults are expensive it does worse than having no model at all.
+
+**Which model is worth more depends on the costs.** The right panel gives the
+paired bootstrap difference between the two models at each cost ratio. These
+intervals are pointwise, so they are summarised by region, again with a paired
+bootstrap over test clients, averaging the difference over the cost ratios of
+the region in each replicate.
+
+| region | average difference, XGBoost minus logistic | 95% interval |
+|---|---|---|
+| $r < 0.15$ | `r pts(reg_low["mean"])` points | [`r pts(reg_low["lo"])`, `r pts(reg_low["hi"])`] |
+| $0.2 < r < 0.6$ | `r pts(reg_mid["mean"])` points | [`r pts(reg_mid["lo"])`, `r pts(reg_mid["hi"])`] |
+
+When acting is cheap compared with a default, the decision is about finding the
+clients safe enough to keep, at the bottom of the risk scale, and there
+XGBoost is ahead`r if (reg_low["lo"] > 0) "" else " on average, though the interval includes zero"`.
+In the middle of the range, around the point Youden's threshold corresponds to,
+the logistic regression is slightly ahead`r if (reg_mid["hi"] < 0) "" else ", though the interval includes zero"`.
+XGBoost's better log loss comes from better probabilities on average, and only
+the probabilities near $t(r)$ change a decision.
+
+The two regions were drawn after looking at this curve on the test set, so the
+intervals above are not those of a test fixed in advance. Part 5 checks whether
+the same pattern appears on other splits of the data.
+
+**The choice between the two models is a business decision.** For a bank
+whose cost ratio lies in the middle range, the logistic regression does at
+least as well as XGBoost on this test set, and it is additive, readable and
+cheaper to validate and monitor. For a bank that acts at low thresholds, XGBoost is the
+better candidate.
+Part 6 looks at what each model has learned.
+
+## Limits
+
+- The value is simulated under a stylised intervention model, not a profit
+  the bank would have realised. The effect of an intervention cannot be
+  observed in these data, and acting is assumed to remove the whole exposure.
+- The cost model is linear and static. In practice acting on an account
+  recovers only part of the exposure, and the loss given default and the margin
+  vary across clients. A richer model would change $r$ client by client but not
+  the logic of comparing a calibrated probability with a cost ratio.
+- The value is measured on one test set of `r format(length(y_te), big.mark = ",")`
+  clients. The intervals account for which clients were drawn, not for the
+  randomness of training, which part 5 addresses.
+- The data come from a single bank in 2005, a year of severe credit card
+  delinquency in Taiwan, with a default rate of `r pct(pi_tr)`. The cost ratios
+  at which acting on everyone beats keeping everyone reflect that rate.
