@@ -133,17 +133,22 @@ the credit limit:
 | `worsening` | September delay larger than August delay |
 | `util_1`, `util_mean`, `util_slope` | utilisation $u_t = B_t / L$: last value, mean and least-squares trend |
 | `repay_1`, `repay_mean` | repayment ratio $r_t = \min(P_t / B_{t+1}, 1)$, set to 1 when $B_{t+1} \le 0$ |
+| `nothing_owed_1`, `months_nothing_owed` | $B_{t+1} \le 0$ in September, and the number of such months; separates a client with nothing to pay from one who paid in full, which $r_t$ alone cannot |
 | `months_no_pay` | months with $B_{t+1} > 0$ and $P_t = 0$ |
-| `spend_1`, `spend_mean` | implied new spending $(B_t - B_{t+1} + P_t) / L$ |
+| `spend_1`, `spend_mean` | implied new charges $(B_t - B_{t+1} + P_t) / L$: purchases plus interest and fees |
 | `log_limit`, `age`, `education`, `marriage` | as given; undocumented education and marriage codes grouped as `other` |
 
-The spending feature comes from the balance identity
+The charges feature comes from the balance identity
 $B_t = B_{t+1} - P_t + \text{purchases}_t + \text{interest and fees}_t$.
-It is the only feature that separates a balance that grows because the client
-keeps buying from one that grows because nothing is paid.
+Purchases and interest cannot be told apart in the data, so the feature measures
+both. It is still the only feature that reacts to what is added to the balance
+rather than to what is paid off.
 
 How well does each feature rank clients on its own? The table gives the AUC of
 each numeric feature used as a score, oriented so that it is above one half.
+This is a description of the full data set, not an out-of-sample result: no
+model is fitted, but the same clients will later be split into training and
+test sets. Out-of-sample performance is measured in the next part.
 
 ```{r univariate}
 auc <- function(s) {
@@ -165,10 +170,28 @@ repayment ratio with the right statement raises its AUC from
 `r sprintf("%.3f", a["repay_1, same-month statement"])` to
 `r sprintf("%.3f", a["repay_1"])`.
 
+The `nothing_owed` flags rank clients no better than chance on their own, but
+they matter next to the repayment ratio. Among the clients with $r_1 = 1$,
+those who had nothing to pay default more often than those who paid the
+statement in full:
+
+```{r nothing-owed}
+s <- f$repay_1 == 1
+no <- data.frame(
+  ` ` = c("statement paid in full", "nothing owed"),
+  clients = format(as.vector(table(f$nothing_owed_1[s])), big.mark = ","),
+  `default rate` = pct(tapply(y[s], f$nothing_owed_1[s], mean)),
+  check.names = FALSE
+)
+knitr::kable(no, align = "lrr", row.names = FALSE)
+```
+
 ## Spending while not repaying
 
 The expectation was that clients who stop repaying but keep spending, living on
-the card, would be the riskiest. The data say otherwise.
+the card, would be the riskiest. The data say otherwise. The two cut-offs below
+(10% repaid, new charges above 2% of the limit) were chosen by hand for this
+table and are not used anywhere else.
 
 ```{r spending}
 low_repay <- f$repay_mean < 0.1
@@ -183,13 +206,13 @@ knitr::kable(grp, align = "lrr")
 late <- tapply(f$months_late, interaction(low_repay, spending), mean)
 ```
 
-The riskiest group repays little and does not spend. These clients were late in
-`r sprintf("%.1f", late["TRUE.FALSE"])` of the six months on average, against
-`r sprintf("%.1f", late["TRUE.TRUE"])` for those who still spend: their balance
-grows through interest and fees, and the card may well be restricted. Low
-spending is then a consequence of delinquency as much as a cause of default.
-The feature is kept, since it carries information the other features do not,
-but it is not read causally.
+The riskiest group repays little and adds little to the balance. These clients
+were late in `r sprintf("%.1f", late["TRUE.FALSE"])` of the six months on
+average, against `r sprintf("%.1f", late["TRUE.TRUE"])` for those who still
+spend. One possible explanation, which the data cannot confirm, is that the bank
+restricts the card once a client falls behind; low spending would then follow
+from delinquency rather than predict default on its own. The feature is kept for
+prediction, but it is not read causally.
 
 ## Inputs to the models
 
@@ -199,4 +222,8 @@ Two input sets are compared in the next part.
   numbers. This is what most analyses of this data set use.
 - **Engineered**: the features above.
 
-If the engineered set does not improve out-of-sample log loss, it is not used.
+The features were designed after looking at all 30,000 clients, test clients
+included. To keep this from biasing the results, the choice between the two
+sets, like every other modelling choice, is made by cross-validation on the
+training set only, and the test set is used once at the end. If the engineered
+set does not improve the cross-validated log loss, it is not used.

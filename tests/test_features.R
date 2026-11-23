@@ -27,6 +27,14 @@ test_that("a statement with nothing owed counts as settled", {
   expect_equal(unname(repayment_ratio(x)[1, 3]), 0)
 })
 
+test_that("nothing owed is flagged apart from a statement paid in full", {
+  none <- build_features(one_client(bill = c(0, 0, 50, 50, 50, 50), pay = c(0, 50, 50, 50, 50, 0)))
+  full <- build_features(one_client(bill = c(0, 50, 50, 50, 50, 50), pay = c(50, 50, 50, 50, 50, 0)))
+  expect_equal(none$repay_1, full$repay_1)
+  expect_equal(c(none$nothing_owed_1, full$nothing_owed_1), c(1, 0))
+  expect_equal(c(none$months_nothing_owed, full$months_nothing_owed), c(1, 0))
+})
+
 test_that("implied spending recovers purchases from the balance identity", {
   # balance 100, pays 30, buys 50: next statement 120
   x <- one_client(bill = c(120, 100, 100, 100, 100, 100), pay = c(30, 0, 0, 0, 0, 0))

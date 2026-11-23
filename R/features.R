@@ -25,7 +25,8 @@ pay_status <- function(code) {
 repayment_ratio <- function(x, cap = 1) {
   pay  <- pay_matrix(x, "PAY_AMT", 1:5)
   owed <- pay_matrix(x, "BILL_AMT", 2:6)
-  r <- ifelse(owed > 0, pay / pmax(owed, 1), 1)   # nothing owed counts as settled
+  # nothing owed is set to 1 here; build_features() flags those months separately
+  r <- ifelse(owed > 0, pay / pmax(owed, 1), 1)
   pmin(r, cap)
 }
 
@@ -79,6 +80,8 @@ build_features <- function(x) {
     util_slope     = slope(util),
     repay_1        = repay[, 1],
     repay_mean     = rowMeans(repay),
+    nothing_owed_1 = as.integer(x$BILL_AMT2 <= 0),
+    months_nothing_owed = rowSums(pay_matrix(x, "BILL_AMT", 2:6) <= 0),
     months_no_pay  = rowSums(pay_matrix(x, "PAY_AMT", 1:5) == 0 & pay_matrix(x, "BILL_AMT", 2:6) > 0),
     spend_1        = spend[, 1],
     spend_mean     = rowMeans(spend)
