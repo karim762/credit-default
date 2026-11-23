@@ -1,0 +1,188 @@
+---
+title: "2. Protocol and model selection"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3.6, dpi = 150)
+```
+
+```{r load}
+source("R/metrics.R")
+source("R/plotting.R")
+r <- readRDS("results/cv.rds")
+y <- r$y
+oof <- r$oof
+pct <- function(v, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * v)
+f4 <- function(v) sprintf("%.4f", v)
+```
+
+The numbers on this page come from `scripts/run_cv.R`, which writes
+`results/cv.rds`.
+
+## Protocol
+
+The clients are split once into a training set
+(`r format(sum(!r$is_test), big.mark = ",")` clients) and a test set
+(`r format(sum(r$is_test), big.mark = ",")`), stratified on the target. The test
+set is not used on this page. The training set is divided into five stratified
+folds, and every choice below (input set, model, hyperparameters) is made on
+out-of-fold predictions: each client is scored by a model that did not see them.
+
+Models are compared on the **log loss** of their predicted probabilities,
+
+$$
+\ell = -\frac{1}{n} \sum_{i=1}^n \big[ y_i \log p_i + (1 - y_i) \log(1 - p_i) \big].
+$$
+
+Accuracy, recall and precision all depend on a decision threshold, and the
+right threshold depends on what a default costs the bank, which is the subject
+of part 4. The log loss is a proper scoring rule: it is minimised in
+expectation by the true probabilities, so a model that wins on it is the one
+whose probabilities can be trusted to set that threshold. The Brier score
+$\frac1n \sum (p_i - y_i)^2$ is another proper score and is reported alongside.
+The AUC only measures how well clients are ranked and says nothing about
+whether a predicted 20% means 20%.
+
+## Models
+
+- **Constant**: the training default rate for everyone. Its log loss, the
+  entropy of the target, is the reference every model has to beat.
+- **Rule**: the single split `PAY_1 >= 2` (two months late in September),
+  turned into a probability by using the default rate of each group. It is the
+  first split a classification tree makes on this data, and a rule a credit
+  officer could apply by hand.
+- **Logistic regression** with an elastic net penalty. Continuous inputs are
+  winsorised and expanded in natural cubic splines with four degrees of
+  freedom, so the model is additive but not linear. The mixing weight
+  $\alpha \in \{0, 0.5, 1\}$ and the penalty $\lambda$ are tuned.
+- **Gradient boosting** (XGBoost) with learning rate 0.03. Thirty random
+  configurations of depth, minimum child weight, row and column subsampling,
+  L2 penalty and minimum split loss are tried, the number of trees being set
+  by early stopping on the mean validation loss.
+
+Each model is fitted on three input sets: the **raw** columns, the
+**engineered** features of part 1, and both **combined**.
+
+## Results
+
+```{r table}
+labels <- c(constant = "Constant", rule = "Rule PAY_1 >= 2",
+            logit_raw = "Logistic, raw", logit_engineered = "Logistic, engineered",
+            logit_combined = "Logistic, combined", xgb_raw = "XGBoost, raw",
+            xgb_engineered = "XGBoost, engineered", xgb_combined = "XGBoost, combined")
+ll0 <- log_loss(y, oof$constant)
+tab <- t(sapply(oof[names(labels)], function(p) scores(y, p)))
+knitr::kable(data.frame(
+  model = labels,
+  `log loss` = f4(tab[, "log_loss"]),
+  `pseudo R2` = sprintf("%.3f", 1 - tab[, "log_loss"] / ll0),
+  Brier = f4(tab[, "brier"]),
+  AUC = sprintf("%.3f", tab[, "auc"]),
+  check.names = FALSE
+), row.names = FALSE, align = "lrrrr")
+```
+
+The pseudo $R^2$ is McFadden's, $1 - \ell / \ell_0$, with $\ell_0$ the log loss
+of the constant.
+
+```{r plot, fig.height = 3.2}
+n <- length(y)
+L <- sapply(oof, function(p) -(y * log(p) + (1 - y) * log(1 - p)))
+set.seed(1)
+boot_idx <- replicate(1000, sample.int(n, replace = TRUE))
+ci <- function(v) quantile(apply(boot_idx, 2, function(i) mean(v[i])), c(0.025, 0.975))
+d <- do.call(rbind, lapply(names(labels)[-(1:2)], function(m) {
+  q <- ci(L[, m])
+  data.frame(model = ifelse(grepl("^logit", m), "Logistic regression", "XGBoost"),
+             set = sub("^[a-z]+_", "", m), ll = mean(L[, m]), lo = q[1], hi = q[2])
+}))
+d$set <- factor(d$set, levels = c("raw", "engineered", "combined"))
+rule_ll <- mean(L[, "rule"])
+ggplot(d, aes(set, ll, colour = model)) +
+  geom_hline(yintercept = rule_ll, linetype = "dashed", colour = palette_main["grey"]) +
+  annotate("text", x = Inf, y = rule_ll, label = "rule PAY_1 >= 2", vjust = 1.6, hjust = 1.05,
+           size = 3, colour = "grey35") +
+  geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(width = 0.4), size = 0.35) +
+  scale_colour_manual(values = unname(palette_main[c("accent", "dark")])) +
+  labs(title = "Out-of-fold log loss by input set",
+       subtitle = "Training set, five folds; bars are 95% bootstrap intervals over clients",
+       x = NULL, y = "Log loss (lower is better)") +
+  theme_report()
+```
+
+Differences between two models are measured on the same clients, so they are
+much more precise than the intervals above suggest. The table gives the mean
+difference in log loss and a 95% interval from a paired bootstrap over clients.
+
+```{r diffs}
+pair <- function(a, b) {
+  dd <- L[, a] - L[, b]
+  q <- quantile(apply(boot_idx, 2, function(i) mean(dd[i])), c(0.025, 0.975))
+  c(mean(dd), q)
+}
+comp <- list(
+  c("logit_engineered", "logit_raw"),
+  c("logit_combined", "logit_engineered"),
+  c("xgb_engineered", "xgb_raw"),
+  c("xgb_combined", "xgb_engineered"),
+  c("xgb_engineered", "logit_engineered"),
+  c("logit_raw", "rule")
+)
+dt <- t(sapply(comp, function(cc) pair(cc[1], cc[2])))
+knitr::kable(data.frame(
+  comparison = sapply(comp, function(cc) paste(labels[cc[1]], "vs", labels[cc[2]])),
+  difference = sprintf("%+.4f", dt[, 1]),
+  `95% interval` = sprintf("[%+.4f, %+.4f]", dt[, 2], dt[, 3]),
+  check.names = FALSE
+), row.names = FALSE, align = "lrr")
+dd <- setNames(as.data.frame(dt), c("m", "lo", "hi"))
+```
+
+**Feature engineering.** For the logistic regression the engineered features
+are the largest gain on this page: the log loss drops by
+`r sprintf("%.4f", -dd$m[1])`, two thirds of the gap between the logistic
+regression and boosting on the raw columns. Boosting gains much less,
+`r sprintf("%.4f", -dd$m[3])`, but the interval excludes zero. Trees presumably
+find most of what the features encode by themselves, except the ratios and the
+alignment of payments with statements, which they cannot build from single
+splits. Adding the raw columns back helps the logistic regression a little more
+and does not help boosting significantly.
+
+**The rule is a hard benchmark.** The one-split rule reaches a pseudo $R^2$ of
+`r sprintf("%.3f", 1 - tab["rule", "log_loss"] / ll0)`, against
+`r sprintf("%.3f", 1 - tab["logit_raw", "log_loss"] / ll0)` for the logistic
+regression on the raw columns, which is the model most analyses of this data
+set report. A model has to earn its complexity against `PAY_1 >= 2`, not
+against a constant.
+
+**Choice of models.** Two models are carried forward:
+
+- **XGBoost on the engineered features**, the main model. The combined set is
+  not significantly better and has twice as many columns.
+- **Logistic regression on the engineered features**, the interpretable
+  reference. It is behind boosting by `r sprintf("%.4f", -dd$m[5])`; part 4
+  checks whether that gap is worth anything once it is converted into money.
+
+```{r hyper}
+bx <- r$tuning$xgb_engineered$best
+bl <- r$tuning$logit_engineered$best
+```
+
+The selected boosting configuration has depth `r bx$max_depth`, minimum child
+weight `r bx$min_child_weight`, row and column subsampling `r bx$subsample` and
+`r bx$colsample_bytree`, L2 penalty `r bx$lambda`, minimum split loss
+`r bx$gamma` and `r bx$nrounds` trees. The logistic regression uses
+$\alpha = `r bl$alpha`$ (lasso) and $\lambda = `r signif(bl$lambda, 2)`$.
+
+## Caveats
+
+- The hyperparameters were chosen on the same folds that produce these scores,
+  so the scores are slightly optimistic, for the selected boosting model more
+  than for the others since it was picked among thirty. The test set gives the
+  unbiased figure in part 3.
+- The bootstrap intervals resample clients but not training sets, so they
+  ignore the variability that comes from refitting the models. Part 5 repeats
+  the whole procedure over several splits.
